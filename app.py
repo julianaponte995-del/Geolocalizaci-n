@@ -5,127 +5,106 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
-# --- CONFIGURACIÓN DE PÁGINA ---
+# 1. Configuración básica
 st.set_page_config(page_title="Geo-Analizador Híbrido", layout="wide")
-st.title("📍 Visualizador de Rutas (Google + Manual)")
 
-# --- INICIALIZACIÓN DE ESTADO (PERSISTENCIA) ---
-# Esto permite que el CSV se quede guardado aunque el uploader se limpie
+# Inicializar sesión para el CSV
 if 'puntos_manuales' not in st.session_state:
     st.session_state['puntos_manuales'] = []
 
-# --- FUNCIONES CON CACHÉ ---
-@st.cache_data
+# 2. Funciones de limpieza
 def procesar_datos_google(datos_json):
-    segments = datos_json.get('semanticSegments', [])
     puntos = []
-    for s in segments:
-        path = s.get('timelinePath', [])
-        for entry in path:
-            point_str = entry.get('point', "")
-            if point_str:
-                try:
-                    # Limpieza de caracteres y conversión
-                    clean_str = point_str.replace('°', '').replace(' ', '')
-                    lat, lon = map(float, clean_str.split(','))
-                    puntos.append({'lat': lat, 'lon': lon, 'fuente': 'Google'})
-                except:
-                    continue
+    try:
+        segments = datos_json.get('semanticSegments', [])
+        for s in segments:
+            path = s.get('timelinePath', [])
+            for entry in path:
+                point_str = entry.get('point', "")
+                if point_str and isinstance(point_str, str):
+                    try:
+                        # Limpiar coordenadas
+                        clean_str = point_str.replace('°', '').replace(' ', '')
+                        lat, lon = map(float, clean_str.split(','))
+                        puntos.append({'lat': lat, 'lon': lon, 'fuente': 'Google'})
+                    except:
+                        continue
+    except Exception as e:
+        st.warning(f"Aviso en JSON: {e}")
     return puntos
 
-@st.cache_data
 def procesar_csv(file_csv):
     try:
-        df_manual = pd.read_csv(file_csv)
-        # Normalizamos nombres de columnas a minúsculas para evitar errores (Lat vs lat)
-        df_manual.columns = [c.lower().strip() for c in df_manual.columns]
-        
-        if 'lat' in df_manual.columns and 'lon' in df_manual.columns:
-            df_manual['fuente'] = 'Manual'
-            return df_manual[['lat', 'lon', 'fuente']].to_dict('records')
-        else:
-            return None
+        df = pd.read_csv(file_csv)
+        # Limpiar nombres de columnas
+        df.columns = [c.lower().strip() for c in df.columns]
+        if 'lat' in df.columns and 'lon' in df.columns:
+            # Eliminar filas con coordenadas vacías
+            df = df.dropna(subset=['lat', 'lon'])
+            df['fuente'] = 'Manual'
+            return df[['lat', 'lon', 'fuente']].to_dict('records')
     except Exception as e:
-        return f"Error: {e}"
+        st.error(f"Error procesando CSV: {e}")
+    return None
 
-# --- BARRA LATERAL ---
+# 3. Interfaz de usuario
+st.title("📍 Visualizador de Rutas")
+
 with st.sidebar:
-    st.header("1. Carga de Datos")
+    st.header("1. Carga de Archivos")
+    arc_json = st.file_uploader("Sube tu JSON de Google", type=['json'])
+    arc_csv = st.file_uploader("Sube tu CSV Manual", type=['csv'])
     
-    # Google JSON (Carga temporal)
-    archivo_json = st.file_uploader("Sube tu JSON de Google", type=['json'])
-    
-    st.divider()
-    
-    # CSV Manual (Carga persistente)
-    nuevo_csv = st.file_uploader("Sube tu CSV de Rutas Manuales", type=['csv'])
-    
-    if nuevo_csv:
-        resultado = procesar_csv(nuevo_csv)
-        if isinstance(resultado, list):
-            st.session_state['puntos_manuales'] = resultado
-            st.success("✅ CSV cargado en memoria")
-        else:
-            st.error(resultado if resultado else "El CSV debe tener columnas 'lat' y 'lon'")
+    if arc_csv:
+        res = procesar_csv(arc_csv)
+        if res:
+            st.session_state['puntos_manuales'] = res
+            st.success("✅ CSV cargado")
 
-    if st.button("Limpiar datos del CSV"):
+    if st.button("Limpiar Memoria CSV"):
         st.session_state['puntos_manuales'] = []
         st.rerun()
 
-    st.header("2. Personalización")
-    radio_calor = st.slider("Radio del Heatmap", 5, 30, 12)
-    opacidad = st.slider("Opacidad", 0.1, 1.0, 0.6)
+    st.header("2. Ajustes")
+    radio_calor = st.slider("Radio", 5, 30, 15)
 
-# --- LÓGICA PRINCIPAL DE UNIFICACIÓN ---
-puntos_totales = []
+# 4. Lógica de unión de datos
+puntos_finales = []
 
-# 1. Añadir puntos de Google si existe el archivo
-if archivo_json:
+if arc_json:
     try:
-        data_j = json.load(archivo_json)
-        puntos_totales.extend(procesar_datos_google(data_j))
-    except Exception as e:
-        st.error(f"Error al leer el JSON: {e}")
+        datos_dict = json.load(arc_json)
+        puntos_finales.extend(procesar_datos_google(datos_dict))
+    except:
+        st.error("El archivo JSON no tiene un formato válido.")
 
-# 2. Añadir puntos del CSV desde el estado de sesión (persistencia)
 if st.session_state['puntos_manuales']:
-    puntos_totales.extend(st.session_state['puntos_manuales'])
+    puntos_finales.extend(st.session_state['puntos_manuales'])
 
-# --- VISUALIZACIÓN ---
-if puntos_totales:
-    df = pd.DataFrame(puntos_totales)
-
-    # Métricas informativas
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Puntos", len(df))
-    c2.metric("Puntos Google", len(df[df['fuente'] == 'Google']))
-    c3.metric("Puntos Manuales", len(df[df['fuente'] == 'Manual']))
-
-    # Mapa
-    # Usamos la media para centrar, pero Folium es robusto
-    centro_lat = df['lat'].mean()
-    centro_lon = df['lon'].mean()
+# 5. Renderizado del Mapa
+if puntos_finales:
+    df_final = pd.DataFrame(puntos_finales)
     
-    m = folium.Map(location=[centro_lat, centro_lon], zoom_start=12, control_scale=True)
-    
-    # Capa de Calor
-    HeatMap(
-        data=df[['lat', 'lon']].values.tolist(), 
-        radius=radio_calor, 
-        min_opacity=opacidad
-    ).add_to(m)
-    
-    st_folium(m, width="100%", height=600)
+    # Métricas rápidas
+    col1, col2 = st.columns(2)
+    col1.metric("Total Puntos", len(df_final))
+    col2.metric("Manuales en Memoria", len(st.session_state['puntos_manuales']))
 
+    try:
+        # Calcular centro (con fallback por si acaso)
+        lat_center = df_final['lat'].median()
+        lon_center = df_final['lon'].median()
+        
+        m = folium.Map(location=[lat_center, lon_center], zoom_start=12)
+        
+        # Añadir Heatmap
+        HeatMap(df_final[['lat', 'lon']].values.tolist(), radius=radio_calor).add_to(m)
+        
+        # Mostrar mapa (usamos parámetros más compatibles para la nube)
+        st_folium(m, width=1100, height=600, returned_objects=[])
+        
+    except Exception as e:
+        st.error(f"Error al generar el mapa: {e}")
+        st.write("Datos procesados:", df_final.head())
 else:
-    st.info("👋 ¡Bienvenido! Sube un archivo JSON de Google o un CSV para empezar a visualizar.")
-    st.markdown("""
-    **Formato del CSV esperado:**
-    - Debe contener al menos dos columnas: `lat` y `lon`.
-    - Ejemplo:
-    ```csv
-    lat,lon
-    19.4326,-99.1332
-    19.4335,-99.1340
-    ```
-    """)
+    st.info("Sube un archivo para empezar a visualizar.")
